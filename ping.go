@@ -14,6 +14,9 @@ import (
 
 type Protocol int
 
+// Note that UDP here, confusingly, does _not_ stand for the UDP protocol.
+// When passed "udp4" or "udp6", icmp.ListenPacket will bind with SOCK_DGRAM,
+// resuling in an _unprivileged ICMP socket_: https://lwn.net/Articles/420800.
 const (
 	NoProtocol Protocol = iota
 	IPv4
@@ -23,11 +26,11 @@ const (
 )
 
 type Config struct {
-	TTL      int
-	Delay    time.Duration
-	OnlyIPv4 bool
-	OnlyIPv6 bool
-	Rootless bool
+	TTL        int
+	Delay      time.Duration
+	OnlyIPv4   bool
+	OnlyIPv6   bool
+	Privileged bool
 }
 
 type ICMPDefs struct {
@@ -70,26 +73,26 @@ func selectAddr(ips []net.IP, config *Config) (net.Addr, Protocol, error) {
 			if config.OnlyIPv6 {
 				continue
 			}
-			if config.Rootless {
-				protocol = UDPv4
-			} else {
+			if config.Privileged {
 				protocol = IPv4
+			} else {
+				protocol = UDPv4
 			}
 		} else {
 			if config.OnlyIPv4 {
 				continue
 			}
-			if config.Rootless {
-				protocol = UDPv6
-			} else {
+			if config.Privileged {
 				protocol = IPv6
+			} else {
+				protocol = UDPv6
 			}
 		}
 
-		if config.Rootless {
-			addr = &net.UDPAddr{IP: ip}
-		} else {
+		if config.Privileged {
 			addr = &net.IPAddr{IP: ip}
+		} else {
+			addr = &net.UDPAddr{IP: ip}
 		}
 	}
 
@@ -157,6 +160,7 @@ func ping(conn *icmp.PacketConn, addr net.Addr, config *Config, defs *ICMPDefs) 
 
 		sent += 1
 
+	receive:
 		n, _, err := conn.ReadFrom(inbytes[:])
 		if err != nil {
 			return fmt.Errorf("reading response: %w", err)
@@ -174,7 +178,7 @@ func ping(conn *icmp.PacketConn, addr net.Addr, config *Config, defs *ICMPDefs) 
 			if reply, ok := inmsg.Body.(*icmp.Echo); ok {
 				// Unprivileged ICMP sockets do not preserve ID:
 				// instead, it is set to the local port number.
-				if (config.Rootless || reply.ID == body.ID) && reply.Seq == body.Seq {
+				if (reply.ID == body.ID || !config.Privileged) && reply.Seq == body.Seq {
 					fmt.Printf("icmp_seq=%d rtt=%s\n", reply.Seq, rtt)
 					received += 1
 				} else {
@@ -184,6 +188,10 @@ func ping(conn *icmp.PacketConn, addr net.Addr, config *Config, defs *ICMPDefs) 
 					)
 				}
 			}
+		case defs.TypeEchoRequest:
+			// We are listening on a privileged socket and someone is pinging us
+			// Ignore the packet: kernel will respond as appropriate
+			goto receive
 		case defs.TypeTimeExceeded:
 			fmt.Println("time to live exceeded")
 		case defs.TypeUnreachable:
@@ -191,6 +199,7 @@ func ping(conn *icmp.PacketConn, addr net.Addr, config *Config, defs *ICMPDefs) 
 		default:
 			fmt.Println("response not understood")
 		}
+
 		percent := (sent - received) * 10000 / sent
 		fmt.Printf(
 			"%d sent and %d received: %3d.%02d%% lost\n\n",
@@ -240,7 +249,7 @@ func main() {
 	flag.DurationVar(&config.Delay, "delay", time.Second, "delay between requests")
 	flag.BoolVar(&config.OnlyIPv4, "4", false, "use ipv4 or exit with error")
 	flag.BoolVar(&config.OnlyIPv6, "6", false, "use ipv6 or exit with error")
-	flag.BoolVar(&config.Rootless, "rootless", true, "use an unprivileged socket")
+	flag.BoolVar(&config.Privileged, "privileged", false, "use a privileged socket")
 	flag.Parse()
 
 	if flag.NArg() != 1 {
